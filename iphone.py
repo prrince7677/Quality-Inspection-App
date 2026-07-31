@@ -3,25 +3,66 @@ from docx import Document
 from docx.shared import Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import io
-from PIL import Image
-import zipfile
 import os
+import tempfile
 import datetime
+from PIL import Image
+import cv2
+
+# --- Smart Helper to find Logo File in Repository ---
+def get_logo_path():
+    for file in os.listdir('.'):
+        if file.lower().startswith('logo') and file.lower().endswith(('.png', '.jpg', '.jpeg')):
+            return file
+    return None
+
+# --- Function to extract thumbnail frame from Video ---
+def extract_video_frame(video_file):
+    try:
+        # Save video temporarily to read frame
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+            tmp.write(video_file.getvalue())
+            tmp_path = tmp.name
+
+        cap = cv2.VideoCapture(tmp_path)
+        ret, frame = cap.read() # Capture 1st frame
+        cap.release()
+        os.remove(tmp_path)
+
+        if ret:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(frame_rgb)
+            img_byte_arr = io.BytesIO()
+            pil_img.save(img_byte_arr, format='PNG')
+            img_byte_arr.seek(0)
+            return img_byte_arr
+    except Exception as e:
+        st.error(f"Video frame extract error: {e}")
+    return None
 
 # --- Word Document Generator Function ---
 def create_inspection_report(images_data, videos_data, all_sections, details):
     doc = Document()
     
-    # 1. Add Lifelong Logo (Center Aligned)
-    if os.path.exists("logo.png"):
-        doc.add_picture("logo.png", width=Inches(2.0))
-        last_paragraph = doc.paragraphs[-1]
-        last_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        doc.add_paragraph() # Add space after logo
-        
+    # 1. Add Logo in Document HEADER (Top Left Side)
+    logo_file = get_logo_path()
+    section = doc.sections[0]
+    header = section.header
+    header_para = header.paragraphs[0]
+    header_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    
+    if logo_file:
+        try:
+            header_para.add_run().add_picture(logo_file, width=Inches(1.8))
+        except Exception as e:
+            header_para.text = "LIFELONG QUALITY INSPECTION"
+    else:
+        header_para.text = "LIFELONG QUALITY INSPECTION"
+
+    # 2. Document Title
     doc.add_heading('Quality Inspection Report', 0)
     
-    # 2. Add Inspection Details Table
+    # 3. Add Inspection Details Table
     meta_table = doc.add_table(rows=6, cols=2)
     meta_table.style = 'Table Grid'
     
@@ -40,71 +81,66 @@ def create_inspection_report(images_data, videos_data, all_sections, details):
         row_cells[1].text = val if val else "N/A"
         row_cells[0].paragraphs[0].runs[0].bold = True
         
-    doc.add_paragraph() # Add space after table
+    doc.add_paragraph() # Spacing
     
-    # 3. Add Evidence Sections
-    for section in all_sections:
-        images = images_data.get(section, [])
-        videos = videos_data.get(section, [])
+    # 4. Add Evidence Sections (Images + Video Snapshots inside Doc Grid)
+    for sec_name in all_sections:
+        images = images_data.get(sec_name, [])
+        videos = videos_data.get(sec_name, [])
+        
+        # Combine photos and video frames into a single media list
+        combined_media = []
+        for img in images:
+            combined_media.append(("📷 Photo", img))
+            
+        for vid in videos:
+            frame_bytes = extract_video_frame(vid)
+            if frame_bytes:
+                combined_media.append((f"🎥 Video Frame ({vid.name})", frame_bytes))
         
         num_cols = 2 
-        num_image_rows = max(1, (len(images) + num_cols - 1) // num_cols) if images else 1
+        num_rows = max(1, (len(combined_media) + num_cols - 1) // num_cols) if combined_media else 1
         
-        table = doc.add_table(rows=num_image_rows + 1, cols=num_cols)
+        table = doc.add_table(rows=num_rows + 1, cols=num_cols)
         table.style = 'Table Grid' 
         
-        # Section Header
+        # Section Header Row
         header_cell = table.cell(0, 0)
         header_cell.merge(table.cell(0, num_cols - 1))
         header_paragraph = header_cell.paragraphs[0]
-        run = header_paragraph.add_run(section)
+        run = header_paragraph.add_run(sec_name)
         run.bold = True 
         
-        # Add Images to Table
-        if images:
-            for i, img_file in enumerate(images):
+        if combined_media:
+            for i, (label, item_bytes) in enumerate(combined_media):
                 row_idx = (i // num_cols) + 1
                 col_idx = i % num_cols
                 cell = table.cell(row_idx, col_idx)
                 paragraph = cell.paragraphs[0]
                 
                 run = paragraph.add_run()
-                run.add_picture(io.BytesIO(img_file.getvalue()), width=Inches(2.5)) 
+                if hasattr(item_bytes, 'getvalue'):
+                    run.add_picture(io.BytesIO(item_bytes.getvalue()), width=Inches(2.5))
+                else:
+                    run.add_picture(io.BytesIO(item_bytes.read()), width=Inches(2.5))
+                
+                # Label below the media item
+                p_label = cell.add_paragraph(label)
+                p_label.runs[0].font.size = Inches(0.11)
         else:
             empty_cell = table.cell(1, 0)
             empty_cell.merge(table.cell(1, num_cols - 1))
-            empty_cell.text = "No images provided"
+            empty_cell.text = "No images or videos provided"
         
         doc.add_paragraph()
-        
-        # Add Video Names below the table if any exist
-        if videos:
-            vid_p = doc.add_paragraph()
-            vid_run = vid_p.add_run(f"🎥 Attached Video Evidence for {section}:")
-            vid_run.bold = True
-            for vid in videos:
-                doc.add_paragraph(f" - {vid.name}", style='List Bullet')
-            doc.add_paragraph()
             
     bio = io.BytesIO()
     doc.save(bio)
     return bio.getvalue()
 
-# --- ZIP Generator Function (Bundles Doc + Videos) ---
-def create_zip_package(docx_data, videos_data, report_name):
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-        zip_file.writestr(f"{report_name}.docx", docx_data)
-        for sec, vids in videos_data.items():
-            for vid in vids:
-                vid.seek(0)
-                zip_file.writestr(f"Videos/{sec}_{vid.name}", vid.read())
-    return zip_buffer.getvalue()
-
-# --- UI Design for Mobile/Web ---
+# --- Streamlit UI Design ---
 st.title("📱 Quality Inspection App")
 
-# State Management
 if 'selected_images' not in st.session_state:
     st.session_state.selected_images = {}
 if 'selected_videos' not in st.session_state:
@@ -153,7 +189,7 @@ if st.button("Save Files to Section", type="primary"):
             else:
                 st.session_state.selected_images[section_choice].append(file)
                 
-        st.success(f"Successfully added {len(uploaded_files)} file(s) to {section_choice}!")
+        st.success(f"Added {len(uploaded_files)} file(s) to {section_choice}!")
     else:
         st.error("Please select files first.")
 
@@ -173,20 +209,19 @@ if st.session_state.selected_images or st.session_state.selected_videos:
                         st.image(img, use_container_width=True)
             if vids:
                 for vid in vids:
-                    st.info(f"🎥 {vid.name}")
+                    st.info(f"🎥 Video: {vid.name}")
 
 # Step 5: Generate Report
 st.divider()
 st.subheader("5. Finalize Report")
 report_name = st.text_input("Report Name", f"{sku_id}_Inspection_Report" if sku_id else "Quality_Inspection_Report")
 
-if st.button("Generate & Download Report", type="primary"):
+if st.button("Generate Word Report", type="primary"):
     if not st.session_state.selected_images and not st.session_state.selected_videos:
         st.warning("Please add at least one image or video before generating the report.")
     else:
-        with st.spinner("Generating document and packaging videos..."):
+        with st.spinner("Creating Word Report with images & video frames..."):
             
-            # Pack the details into a dictionary to send to the Word function
             report_details = {
                 'date': insp_date,
                 'vendor': vendor_name,
@@ -198,22 +233,11 @@ if st.button("Generate & Download Report", type="primary"):
             
             docx_data = create_inspection_report(st.session_state.selected_images, st.session_state.selected_videos, st.session_state.sections_list, report_details)
             
-            has_videos = any(len(vids) > 0 for vids in st.session_state.selected_videos.values())
-            
-            if has_videos:
-                final_data = create_zip_package(docx_data, st.session_state.selected_videos, report_name)
-                final_filename = f"{report_name}.zip"
-                mime_type = "application/zip"
-            else:
-                final_data = docx_data
-                final_filename = f"{report_name}.docx"
-                mime_type = "application/octet-stream" 
-                
             st.download_button(
-                label="📥 Download Report Files",
-                data=final_data,
-                file_name=final_filename,
-                mime=mime_type
+                label="📥 Download .docx Word Report",
+                data=docx_data,
+                file_name=f"{report_name}.docx",
+                mime="application/octet-stream"
             )
 
 if st.button("Reset / Clear All Data"):
