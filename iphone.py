@@ -139,7 +139,7 @@ def create_inspection_report(images_data, videos_data, all_sections, details):
     return bio.getvalue()
 
 # --- Streamlit UI Design ---
-st.title("📱 Quality Inspection App")
+st.title("📱 Lifelong QA Report Maker")
 
 if 'selected_images' not in st.session_state:
     st.session_state.selected_images = {}
